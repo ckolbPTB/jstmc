@@ -7,6 +7,7 @@ import typing
 
 import matplotlib.pyplot as plt
 import pypulseq as pp
+import pypulseq.rotate as pp_rot
 
 import numpy as np
 import rf_pulse_files as rfpf
@@ -199,7 +200,11 @@ class GRAD(Event):
 
         self.max_slew: float = self.system.max_slew
         self.max_grad: float = self.system.max_grad
-
+        
+        # rotation of gradients (only applied when convering to simple ns)
+        self.rotation_angle = None
+        self.rotation_axis = None
+        
         # needed in this project for referencing slice select extended gradients. easy hack
         self.slice_select_amplitude: float = NotImplemented
         self.slice_select_duration: float = NotImplemented
@@ -523,11 +528,14 @@ class GRAD(Event):
         return self.t_array_s[-1]
 
     def to_simple_ns(self):
-        return types.SimpleNamespace(
+        simple_ns = types.SimpleNamespace(
             channel=self.channel, type='grad',
             delay=self.t_delay_s, first=self.amplitude[0], last=self.amplitude[-1],
             shape_dur=self.t_duration_s, tt=self.t_array_s, waveform=self.amplitude
         )
+        if self.rotation_angle is not None and self.rotation_axis is not None:
+            simple_ns = pp_rot.rotate(simple_ns, angle=self.rotation_angle, axis=self.rotation_axis)
+        return simple_ns
 
     def plot(self):
         fig = plt.figure()

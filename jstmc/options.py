@@ -60,6 +60,9 @@ class SequenceParameters(sp.helpers.Serializable):
 
     numberOfCentralLines: int = 40
     accelerationFactor: float = 2.0
+    
+    trajectoryType: str = 'cartesian' # options: cartesian, radial
+    radialSameTrajPerEcho: bool = True # acquire the same radial angles for each echo
 
     excitationFA: float = 90.0
     excitationRfPhase: float = 90.0  # °
@@ -129,6 +132,11 @@ class SequenceParameters(sp.helpers.Serializable):
             # fill up list with last value
             self.refocusingFA.append(self.refocusingFA[-1])
             self.refocusingRfPhase.append(self.refocusingRfPhase[-1])
+            
+        # radial sampling
+        self.radialNumSpokes = self.resolutionBase # fully sampled in the Cartesian sense, i.e. without factor pi/2
+        self.radialAngStep = np.pi / self.radialNumSpokes # uniform radial sampling
+        self.radialAngList = self.radialAngStep * np.arange(0, self.radialNumSpokes)
 
         # casting
         self.excitationRadFA = self.excitationFA / 180.0 * np.pi

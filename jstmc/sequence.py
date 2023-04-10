@@ -3,8 +3,10 @@ import matplotlib.pyplot as plt
 from jstmc import events, options
 import numpy as np
 import pypulseq as pp
+import pypulseq.rotate as pp_rot
 import logging
 import tqdm
+import typing
 
 logModule = logging.getLogger(__name__)
 
@@ -21,7 +23,8 @@ class EventBlock:
             grad_phase: events.GRAD = events.GRAD(),
             grad_slice: events.GRAD = events.GRAD(),
             adc: events.ADC = events.ADC(),
-            delay: events.DELAY = events.DELAY()):
+            delay: events.DELAY = events.DELAY(),
+            add_para: typing.Dict[str, typing.Any] = {}):
 
         self.system = system
 
@@ -34,9 +37,21 @@ class EventBlock:
         self.adc: events.ADC = adc
 
         self.delay: events.DELAY = delay
+        
+        # additional parameters such as orig readout gradient amplitude without rotation
+        self.add_para: typing.Dict[str, typing.Any] = add_para
+
 
     def list_events_to_ns(self):
-        return [ev.to_simple_ns() for ev in self.list_events()]
+        # Rotating a gradient leads to a list of multiple gradients
+        ev_simple_ns = []
+        for ev in self.list_events():
+            simple_ns = ev.to_simple_ns()
+            if type(simple_ns) is list:
+                ev_simple_ns += simple_ns
+            else:
+                ev_simple_ns.append(simple_ns)
+        return ev_simple_ns
 
     def list_events(self):
         event_list = [self.rf, self.grad_read, self.grad_slice, self.grad_phase, self.adc, self.delay]
@@ -101,18 +116,24 @@ class EventBlock:
         )
         # block is first refocusing + spoiling + phase encode
         logModule.info(f"setup refocus {pulse_num + 1}")
-        # set up longest phase encode
-        phase_grad_areas = (- np.arange(params.resolutionNPhase) + params.resolutionNPhase / 2) * \
-                           params.deltaK_phase
-        # build longest phase gradient
-        grad_phase = events.GRAD.make_trapezoid(
-            channel=params.phase_dir,
-            area=np.max(phase_grad_areas),
-            system=system
-        )
-        duration_phase_grad = set_on_grad_raster_time(
-            time=grad_phase.get_duration(), system=system
-        )
+        if params.trajectoryType.lower() == 'cartesian':
+            # set up longest phase encode
+            phase_grad_areas = (- np.arange(params.resolutionNPhase) + params.resolutionNPhase / 2) * \
+                            params.deltaK_phase
+            # build longest phase gradient
+            grad_phase = events.GRAD.make_trapezoid(
+                channel=params.phase_dir,
+                area=np.max(phase_grad_areas),
+                system=system
+            )
+            duration_phase_grad = set_on_grad_raster_time(
+                time=grad_phase.get_duration(), system=system
+            )
+        elif params.trajectoryType.lower() == 'radial':
+            # for radial sampling (re-/prewinding) gradient along phase and readout are identical
+            duration_phase_grad = 0.0
+        else:
+            raise TypeError(f"trajectory type {params.trajectoryType.lower()} not recognised")
 
         # build read spoiler
         grad_prewind_read = events.GRAD.make_trapezoid(
@@ -159,7 +180,8 @@ class EventBlock:
         )
         if duration_min < grad_slice_spoil_re_time:
             logModule.info(f"adjusting phase encode gradient durations (got time to spare)")
-            duration_phase_grad = grad_slice_spoil_re_time
+            if params.trajectoryType.lower() == "cartesian":
+                duration_phase_grad = grad_slice_spoil_re_time
             duration_pre_read = grad_slice_spoil_re_time
 
         # adjust rf start
@@ -169,14 +191,23 @@ class EventBlock:
             # set symmetrical x / y
             # duration between - rather take middle part of slice select, rf duration on different raster possible
             t_duration_between = grad_slice.set_on_raster(grad_slice.slice_select_duration)
-            grad_phase = events.GRAD.sym_grad(
-                system=system, channel=params.phase_dir, area_lobe=np.max(phase_grad_areas),
-                duration_lobe=duration_phase_grad, duration_between=t_duration_between, reverse_second_lobe=True
-            )
             grad_read_prewind = events.GRAD.sym_grad(
                 system=system, channel=params.read_dir, area_lobe=- grad_read.area / 2, duration_lobe=duration_pre_read,
                 duration_between=rf.t_duration_s
             )
+            if params.trajectoryType.lower() == "cartesian":
+                grad_phase = events.GRAD.sym_grad(
+                    system=system, channel=params.phase_dir, area_lobe=np.max(phase_grad_areas),
+                    duration_lobe=duration_phase_grad, duration_between=t_duration_between, reverse_second_lobe=True
+                )
+            elif params.trajectoryType.lower() == "radial":
+                # make copy for radial gradients
+                grad_phase = events.GRAD.sym_grad(
+                    system=system, channel=params.phase_dir, area_lobe=- grad_read.area / 2, duration_lobe=duration_pre_read,
+                    duration_between=rf.t_duration_s
+                )
+            else:
+                raise TypeError(f"trajectory type {params.trajectoryType.lower()} not recognised")
         else:
             grad_read_prewind = events.GRAD.make_trapezoid(
                 channel=params.read_dir,
@@ -184,25 +215,33 @@ class EventBlock:
                 duration_s=duration_pre_read,  # given in [s] via options
                 system=system,
             )
-            grad_phase = events.GRAD.make_trapezoid(
-                channel=params.phase_dir,
-                area=np.max(phase_grad_areas),
-                system=system,
-                duration_s=duration_phase_grad
-            )
-            # adjust phase start
-            delay_phase_grad = rf.t_delay_s + rf.t_duration_s
-            grad_phase.t_delay_s = delay_phase_grad
+            # adjust starting point of gradients
+            delay_grad = rf.t_delay_s + rf.t_duration_s
             # adjust read start
-            grad_read_prewind.t_delay_s = delay_phase_grad
+            grad_read_prewind.t_delay_s = delay_grad
+            if params.trajectoryType.lower() == "cartesian":
+                grad_phase = events.GRAD.make_trapezoid(
+                    channel=params.phase_dir,
+                    area=np.max(phase_grad_areas),
+                    system=system,
+                    duration_s=duration_phase_grad
+                )
+                # adjust phase start
+                grad_phase.t_delay_s = delay_grad
+            elif params.trajectoryType.lower() == "radial":
+                grad_phase = events.GRAD()
+            else:
+                raise TypeError(f"trajectory type {params.trajectoryType.lower()} not recognised")
+                
 
         # finished block
         _instance = cls(
             rf=rf, grad_slice=grad_slice,
-            grad_phase=grad_phase, grad_read=grad_read_prewind
+            grad_phase=grad_phase, grad_read=grad_read_prewind,
+            add_para={"grad_read_prewind_amplitude" : grad_read_prewind.amplitude}
         )
         if return_pe_time:
-            return _instance, grad_phase.set_on_raster(duration_phase_grad)
+            return _instance, grad_read.set_on_raster(duration_phase_grad)
         else:
             return _instance
 
@@ -228,6 +267,9 @@ class EventBlock:
             logModule.error(err)
             raise ValueError(err)
         adc.t_delay_s = delay
+        # shift by half a dwell time to ensure sampling in k-space centre
+        if params.trajectoryType.lower() == "radial":
+            adc.t_delay_s-=params.dwell/2.
         # finished block
         return cls(adc=adc, grad_read=grad_read)
 
@@ -237,18 +279,29 @@ class EventBlock:
             channel=params.read_dir, system=system,
             flat_area=params.deltaK_read * params.resolutionNRead, flat_time=params.acquisitionTime
         )
-        phase_grad_areas = (- np.arange(params.resolutionNPhase) + params.resolutionNPhase / 2) * \
+        if params.trajectoryType.lower() == "cartesian":
+            phase_grad_areas = (- np.arange(params.resolutionNPhase) + params.resolutionNPhase / 2) * \
                            params.deltaK_phase
+        elif params.trajectoryType.lower() == "radial":
+            phase_grad_areas = 0.0
+        else:
+            raise TypeError(f"trajectory type {params.trajectoryType.lower()} not recognised")
+            
         grad_read_spoil = events.GRAD.make_trapezoid(
             channel=params.read_dir,
             area=-1 / 2 * grad_read.area,
             system=system
         )
-        grad_phase = events.GRAD.make_trapezoid(
-            channel=params.phase_dir,
-            area=np.max(phase_grad_areas),
-            system=system
-        )
+        if params.trajectoryType.lower() == "cartesian":
+            grad_phase = events.GRAD.make_trapezoid(
+                channel=params.phase_dir,
+                area=np.max(phase_grad_areas),
+                system=system
+            )
+        elif params.trajectoryType.lower() == "radial":
+            grad_phase = events.GRAD()
+        else:
+            raise TypeError(f"trajectory type {params.trajectoryType.lower()} not recognised")
         grad_slice = events.GRAD.make_trapezoid(
             channel='z',
             system=system,
@@ -264,12 +317,13 @@ class EventBlock:
             system=system,
             duration_s=duration
         )
-        grad_phase = events.GRAD.make_trapezoid(
-            channel=params.phase_dir,
-            area=np.max(phase_grad_areas),
-            system=system,
-            duration_s=duration
-        )
+        if params.trajectoryType.lower() == "cartesian":
+            grad_phase = events.GRAD.make_trapezoid(
+                channel=params.phase_dir,
+                area=np.max(phase_grad_areas),
+                system=system,
+                duration_s=duration
+            )
         grad_slice = events.GRAD.make_trapezoid(
             channel='z',
             system=system,
@@ -388,14 +442,30 @@ class JsTmcSequence:
 
         # phase grads
         self.phase_areas: np.ndarray = (- np.arange(self.params.resolutionNPhase) +
-                                        self.params.resolutionNPhase / 2) * self.params.deltaK_phase
+                                    self.params.resolutionNPhase / 2) * self.params.deltaK_phase
+
+                
         # slice loop
         numSlices = self.params.resolutionNumSlices
         self.z = np.zeros((2, int(np.ceil(numSlices / 2))))
         self.trueSliceNum = np.zeros(numSlices)
         # k space
+        if self.params.trajectoryType.lower() == "cartesian":
+            number_of_ET = self.params.numberOfCentralLines + self.params.numberOfOuterLines
+        elif self.params.trajectoryType.lower() == "radial":
+            if self.params.radialSameTrajPerEcho:
+                number_of_ET = self.params.radialNumSpokes
+            else:
+                number_of_ET = int(np.floor(self.params.radialNumSpokes / self.params.ETL))
+                if number_of_ET * self.params.ETL < self.params.radialNumSpokes:
+                    logModule.info(f"with an ETL of {self.params.ETL} only a  total number "\
+                        f"of spokes of {self.params.ETL * number_of_ET} rather than "\
+                        f"{self.params.radialNumSpokes} is possible")
+        else:
+            raise TypeError(f"trajectory type {self.params.trajectoryType.lower()} not recognised")
+
         self.k_indexes: np.ndarray = np.zeros(
-            (self.params.ETL, self.params.numberOfCentralLines + self.params.numberOfOuterLines),
+            (self.params.ETL, number_of_ET), 
             dtype=int
         )
         self.sampling_pattern: list = []
@@ -499,9 +569,7 @@ class JsTmcSequence:
 
     def _loop_lines(self):
         # through phase encodes
-        line_bar = tqdm.trange(
-            self.params.numberOfCentralLines + self.params.numberOfOuterLines, desc="phase encodes"
-        )
+        line_bar = tqdm.trange(self.k_indexes.shape[1], desc="phase encodes")
         for idx_n in line_bar:  # We have N phase encodes for all ETL contrasts
             for idx_slice in range(self.params.resolutionNumSlices):
                 # looping through slices per phase encode
@@ -527,6 +595,7 @@ class JsTmcSequence:
                     self.seq.ppSeq.add_block(self.delay_ref_adc.to_simple_ns())
 
                 # adc
+                self._set_read_grad(phase_idx=idx_n, echo_idx=0)
                 self.seq.ppSeq.add_block(*self.block_acquisition.list_events_to_ns())
                 # write sampling pattern
                 self._write_sampling_pattern(phase_idx=idx_n, echo_idx=0, slice_idx=idx_slice)
@@ -549,6 +618,7 @@ class JsTmcSequence:
                         self.seq.ppSeq.add_block(self.delay_ref_adc.to_simple_ns())
 
                     # adc
+                    self._set_read_grad(echo_idx=echo_idx, phase_idx=idx_n)
                     self.seq.ppSeq.add_block(*self.block_acquisition.list_events_to_ns())
                     # write sampling pattern
                     self._write_sampling_pattern(echo_idx=echo_idx, phase_idx=idx_n, slice_idx=idx_slice)
@@ -580,12 +650,56 @@ class JsTmcSequence:
         else:
             sbb = self.block_refocus
             last_idx_phase = self.k_indexes[echo_idx - 1, phase_idx]
-            sbb.grad_phase.amplitude[1:3] = self.phase_areas[last_idx_phase] / self.phase_enc_time
-        if np.abs(self.phase_areas[idx_phase]) > 0:
-            sbb.grad_phase.amplitude[-3:-1] = - self.phase_areas[idx_phase] / self.phase_enc_time
-        else:
-            sbb.grad_phase.amplitude = np.zeros_like(sbb.grad_phase.amplitude)
-        self.block_spoil_end.grad_phase.amplitude[1:3] = - sbb.grad_phase.amplitude[-3:-1]
+        if self.params.trajectoryType.lower() == "cartesian": 
+            if echo_idx > 0:
+                sbb.grad_phase.amplitude[1:3] = self.phase_areas[last_idx_phase] / self.phase_enc_time
+            if np.abs(self.phase_areas[idx_phase]) > 0:
+                sbb.grad_phase.amplitude[-3:-1] = - self.phase_areas[idx_phase] / self.phase_enc_time
+            else:
+                sbb.grad_phase.amplitude = np.zeros_like(sbb.grad_phase.amplitude)
+            self.block_spoil_end.grad_phase.amplitude[1:3] = - sbb.grad_phase.amplitude[-3:-1]
+        elif self.params.trajectoryType.lower() == "radial":
+            # rotate the readout gradient with the previous angle and the current angle
+            # and adapt the amplitude before and after the refocusing pulse accordingly
+            if echo_idx > 0:
+                sbb.grad_read.amplitude = sbb.add_para["grad_read_prewind_amplitude"].copy()
+                sbb_simple_ns = sbb.grad_read.to_simple_ns()
+                for pos in ["pre", "post"]:
+                    if pos == "pre":
+                        idx_angle = last_idx_phase
+                        idx_grad = 1
+                    else:
+                        idx_angle = idx_phase
+                        idx_grad = 5
+                    # rotate readout gradient
+                    grad_rot = pp_rot.rotate(sbb_simple_ns, angle=self.params.radialAngList[idx_angle], axis="z")
+                    # adapt x and y gradient amplitude
+                    grad_rot_channel = [grad.channel for grad in grad_rot]
+                    for c_idx in ["x", "y"]:
+                        # for 0°, 90°... rotations only one gradient is returned
+                        if c_idx not in grad_rot_channel:
+                            grad_amp = np.zeros_like(grad_rot[0].waveform)
+                        else:
+                            grad_amp = grad_rot[grad_rot_channel.index(c_idx)].waveform
+                        if c_idx == "x":
+                            sbb.grad_read.amplitude[idx_grad:idx_grad+2] = grad_amp[idx_grad:idx_grad+2]
+                        elif c_idx == "y":
+                            sbb.grad_phase.amplitude[idx_grad:idx_grad+2] = grad_amp[idx_grad:idx_grad+2]
+                        else:
+                            raise TypeError("Rotation of greadout gradient should only lead to x or y gradient.")
+            else: # rotate the readout gradient
+                sbb.grad_read.rotation_angle = self.params.radialAngList[idx_phase]
+                sbb.grad_read.rotation_axis = "z"
+            self.block_spoil_end.grad_read.rotation_angle = self.params.radialAngList[idx_phase]
+            self.block_spoil_end.grad_read.rotation_axis = "z"
+
+    def _set_read_grad(self, echo_idx: int, phase_idx: int):
+        if self.params.trajectoryType.lower() == "radial":
+            idx_phase = self.k_indexes[echo_idx, phase_idx]
+            sbb = self.block_acquisition
+            sbb.grad_read.rotation_angle = self.params.radialAngList[idx_phase]
+            sbb.grad_read.rotation_axis = "z"
+            
 
     def _apply_slice_offset(self, idx_slice: int):
         for sbb in [self.block_excitation, self.block_refocus_1, self.block_refocus]:
@@ -616,34 +730,44 @@ class JsTmcSequence:
             self.trueSliceNum[idx_slice_num] = z_pos
 
     def _set_k_space(self):
-        if self.params.accelerationFactor > 1.1:
-            # calculate center of k space and indexes for full sampling band
-            k_central_phase = round(self.params.resolutionNPhase / 2)
-            k_half_central_lines = round(self.params.numberOfCentralLines / 2)
-            # set indexes for start and end of full k space center sampling
-            k_start = k_central_phase - k_half_central_lines
-            k_end = k_central_phase + k_half_central_lines
+        if self.params.trajectoryType.lower() == "cartesian": 
+            if self.params.accelerationFactor > 1.1:
+                # calculate center of k space and indexes for full sampling band
+                k_central_phase = round(self.params.resolutionNPhase / 2)
+                k_half_central_lines = round(self.params.numberOfCentralLines / 2)
+                # set indexes for start and end of full k space center sampling
+                k_start = k_central_phase - k_half_central_lines
+                k_end = k_central_phase + k_half_central_lines
 
-            # The rest of the lines we will use tse style phase step blip between the echoes of one echo train
-            # Trying random sampling, ie. pick random line numbers for remaining indices,
-            # we dont want to pick the same positive as negative phase encodes to account for conjugate symmetry in k-space.
-            # Hence, we pick from the positive indexes twice (thinking of the center as 0) without allowing for duplexes
-            # and negate half the picks
-            # calculate indexes
-            k_remaining = np.arange(0, k_start)
-            # build array with dim [num_slices, num_outer_lines] to sample different random scheme per slice
-            for idx_echo in range(self.params.ETL):
-                # same encode for all echoes -> central lines
-                self.k_indexes[idx_echo, :self.params.numberOfCentralLines] = np.arange(k_start, k_end)
-                # random encodes for different echoes
-                k_indices = np.random.choice(
-                    k_remaining,
-                    size=self.params.numberOfOuterLines,
-                    replace=False)
-                k_indices[::2] = self.params.resolutionNPhase - 1 - k_indices[::2]
-                self.k_indexes[idx_echo, self.params.numberOfCentralLines:] = np.sort(k_indices)
+                # The rest of the lines we will use tse style phase step blip between the echoes of one echo train
+                # Trying random sampling, ie. pick random line numbers for remaining indices,
+                # we dont want to pick the same positive as negative phase encodes to account for conjugate symmetry in k-space.
+                # Hence, we pick from the positive indexes twice (thinking of the center as 0) without allowing for duplexes
+                # and negate half the picks
+                # calculate indexes
+                k_remaining = np.arange(0, k_start)
+                # build array with dim [num_slices, num_outer_lines] to sample different random scheme per slice
+                for idx_echo in range(self.params.ETL):
+                    # same encode for all echoes -> central lines
+                    self.k_indexes[idx_echo, :self.params.numberOfCentralLines] = np.arange(k_start, k_end)
+                    # random encodes for different echoes
+                    k_indices = np.random.choice(
+                        k_remaining,
+                        size=self.params.numberOfOuterLines,
+                        replace=False)
+                    k_indices[::2] = self.params.resolutionNPhase - 1 - k_indices[::2]
+                    self.k_indexes[idx_echo, self.params.numberOfCentralLines:] = np.sort(k_indices)
+            else:
+                self.k_indexes[:, :] = np.arange(self.params.numberOfCentralLines + self.params.numberOfOuterLines)
+        elif self.params.trajectoryType.lower() == "radial": 
+            if self.params.radialSameTrajPerEcho:
+                self.k_indexes[:, :] = np.arange(self.params.radialNumSpokes)
+            else:
+                num_spokes_per_ET = self.k_indexes.shape[1]
+                self.k_indexes[:, :] = np.reshape(np.arange(self.params.ETL * num_spokes_per_ET), 
+                                  (self.params.ETL, num_spokes_per_ET))
         else:
-            self.k_indexes[:, :] = np.arange(self.params.numberOfCentralLines + self.params.numberOfOuterLines)
+            raise TypeError(f"trajectory type {self.params.trajectoryType.lower()} not recognised")
 
     def get_pypulseq_seq(self):
         return self.seq.ppSeq
