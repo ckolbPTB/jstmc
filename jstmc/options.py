@@ -3,12 +3,12 @@ import logging
 import numpy as np
 import simple_parsing as sp
 import dataclasses as dc
-from typing import List
+import typing
 import pypulseq as pp
-from pathlib import Path
+import pathlib as plib
 import json
 import pandas as pd
-
+from rf_pulse_files import rfpf
 logModule = logging.getLogger(__name__)
 
 
@@ -29,9 +29,9 @@ class ScannerSpecs(sp.helpers.Serializable):
     # magnet
     b_0: float = 6.98    # [T]
     # gradients
-    max_grad: int = 40.0
+    max_grad: float = 40.0
     grad_unit: str = 'mT/m'
-    max_slew: int = 200.0
+    max_slew: float = 200.0
     slew_unit: str = 'T/m/s'
     rise_time: int = 0  # watch out, rise time != 0 gives max_slew = 0 in opts method
     grad_raster_time: float = 10e-6
@@ -71,15 +71,16 @@ class SequenceParameters(sp.helpers.Serializable):
     excitationPreMoment: float = 1000.0    # Hz/m
     excitationRephaseFactor: float = 1.04  # Correction factor for insufficient rephasing
 
-    refocusingFA: List = dc.field(default_factory=lambda: [140.0])
-    refocusingRfPhase: List = dc.field(default_factory=lambda: [0.0])  # °
+    refocusingFA: typing.List = dc.field(default_factory=lambda: [140.0])
+    refocusingRfPhase: typing.List = dc.field(default_factory=lambda: [0.0])  # °
     refocusingDuration: int = 3000  # [us]
     refocusingTimeBwProd: float = 2.0
-    refocusingScaleSliceGrad: float = 2/3   # adjust slice selective gradient sice of refocusing -
+    refocusingScaleSliceGrad: float = 1.5   # adjust slice selective gradient sice of refocusing -
     # caution: this broadens the slice profile of the pulse, the further away from 180 fa
     # we possibly get saturation outside the slice
-
+    readSpoilingFactor: float = 0.5
     sliceSpoilingMoment: float = 2500.0     # [Hz/m]
+    sliceEndSpoilingMoment: float = 2500    # [Hz/m]
     interleavedAcquisition: bool = True
     # interfacing with rfpf
     extRfExc: str = ""
@@ -91,6 +92,8 @@ class SequenceParameters(sp.helpers.Serializable):
 
     bandwidth: float = 250.0  # [Hz / px]
     oversampling: float = 2.0   # oversampling factor
+    sampleWeighting: float = 0.0    # factor to weight random sampling towards central k-space ->
+    # towards 1 we get densely sampled center
 
     phaseDir: str = "PA"
 
@@ -110,7 +113,17 @@ class SequenceParameters(sp.helpers.Serializable):
         self.numberOfOuterLines = round((self.resolutionNPhase - self.numberOfCentralLines) / self.accelerationFactor)
         # sequence
         self.acquisitionTime = 1 / self.bandwidth
-        self.dwell = self.acquisitionTime / self.resolutionNRead / self.oversampling   # oversampling
+        # dwell needs to be on adc raster time, acquisition time is flexible -> leads to small deviations in bandwidth
+        # adc raster here hardcoded
+        adc_raster = 1e-7
+        s_dwell = self.acquisitionTime / self.resolutionNRead / self.oversampling   # oversampling
+        adcr_dwell = int(1 / adc_raster * s_dwell)
+        self.dwell = adc_raster * adcr_dwell
+        if np.abs(s_dwell - self.dwell > 1e-9):
+            logModule.info(f"setting dwell time on adc raster -> small bw adoptions (set bw: {self.bandwidth:.1f})")
+        # update acquisition time and bandwidth
+        self.acquisitionTime = self.dwell * self.resolutionNRead * self.oversampling
+        self.bandwidth = 1 / self.acquisitionTime
         logModule.info(f"Bandwidth: {self.bandwidth:.1f} Hz/px;"
                        f"Readout time: {self.acquisitionTime * 1e3:.1f} ms;"
                        f"DwellTime: {self.dwell * 1e6:.1f} us;"
@@ -132,7 +145,9 @@ class SequenceParameters(sp.helpers.Serializable):
             # fill up list with last value
             self.refocusingFA.append(self.refocusingFA[-1])
             self.refocusingRfPhase.append(self.refocusingRfPhase[-1])
-            
+        # while self.sliceSpoilingMoment.__len__() < self.ETL:
+        #     self.sliceSpoilingMoment.append(self.sliceSpoilingMoment[-1])
+   
         # radial sampling
         self.radialNumSpokes = self.resolutionBase # fully sampled in the Cartesian sense, i.e. without factor pi/2
         self.radialAngStep = np.pi / self.radialNumSpokes # uniform radial sampling
@@ -156,7 +171,7 @@ class SequenceParameters(sp.helpers.Serializable):
             raise AttributeError(err)
 
         # error catches
-        if self.sliceSpoilingMoment < 1e-7:
+        if np.any(np.array(self.sliceSpoilingMoment) < 1e-7):
             err = f"this implementation needs a spoiling moment supplied: provide spoiling Moment > 0"
             logModule.error(err)
             raise ValueError(err)
@@ -210,7 +225,7 @@ class Sequence:
     @classmethod
     def load(cls, path):
         Seq = Sequence()
-        path = Path(path).absolute()
+        path = plib.Path(path).absolute()
         if not path.is_file():
             raise AttributeError(f"{path} not a file")
         if path.suffix == ".json":
@@ -252,14 +267,15 @@ class Sequence:
         Seq.setDefinitions()
         return Seq
 
-    def save(self, emc_info: dict = None, sampling_pattern: list = None, pulse_signal: tuple = None):
+    def save(self, emc_info: dict = None, sampling_pattern: pd.DataFrame = None,
+             sequence_info: dict = None, pulse_signal: rfpf.RF = None):
         if not self.ppSeq.definitions:
             err = "no export definitions were set (FOV, Name)"
             logModule.error(err)
             raise AttributeError(err)
 
         if self.config.outputPath:
-            path = Path(self.config.outputPath).absolute()
+            path = plib.Path(self.config.outputPath).absolute()
             path.mkdir(parents=True, exist_ok=True)
             if path.is_file():
                 path = path.parent
@@ -280,7 +296,11 @@ class Sequence:
                 self.write_sampling_pattern(sampling_pattern=sampling_pattern)
 
             if pulse_signal is not None:
-                self.write_pulse_to_txt(file_name, pulse_signal)
+                self.write_pulse(file_name, pulse_signal)
+
+            if sequence_info is not None:
+                self.write_sequence_info(sequence_info=sequence_info)
+
         else:
             logModule.info("Not Saving: no Path given")
 
@@ -296,7 +316,7 @@ class Sequence:
             "params": self.params.to_dict()
         }
         if self.config.configFile:
-            save_file = Path(self.config.configFile).absolute()
+            save_file = plib.Path(self.config.configFile).absolute()
         else:
             save_file = file_name.with_name(f"{file_name.name}_config").with_suffix(".json")
         save_dict["config"].__setitem__("configFile", save_file.__str__())
@@ -312,24 +332,55 @@ class Sequence:
             json.dump(emc_info, j_file, indent=2)
 
     @staticmethod
-    def write_pulse_to_txt(file_name, pulse_signal):
-        save_file = file_name.with_name(f"{file_name.name}_pulse").with_suffix(".txt")
+    def write_pulse(file_name, pulse_signal: rfpf.RF):
+        save_file = file_name.with_name(f"{file_name.name}_pulse").with_suffix(".pkl")
         logModule.info(f"writing file: {save_file}")
-        with open(save_file, "w") as f:
-            for idx_sig in range(len(pulse_signal)):
-                f.write(f'{pulse_signal[idx_sig]}\t{0.0}\n')
+        pulse_signal.save(save_file)
 
-    def write_sampling_pattern(self, sampling_pattern: list):
-        path = Path(self.config.outputPath).absolute()
-        path.mkdir(parents=True, exist_ok=True)
-        sp = pd.DataFrame(sampling_pattern)
+    def write_sampling_pattern(self, sampling_pattern: pd.DataFrame):
+        path = plib.Path(self.config.outputPath).absolute()
         file_name = path.joinpath(
             f"jstmc{self.config.version}_{self._set_name_fa()}_{self._set_name_fov()}_{self.params.phaseDir}_sampling"
             f"-pattern"
         )
-        save_file = path.joinpath(file_name).with_suffix(".csv")
-        logModule.info(f"writing file: {save_file}")
-        sp.to_csv(save_file)
+        save_file = path.joinpath(file_name).with_suffix(".pkl")
+        self._save_pd_df(pd_df=sampling_pattern, save_path=save_file)
+
+    def write_sequence_info(self, sequence_info: dict):
+        path = plib.Path(self.config.outputPath).absolute()
+        file_name = path.joinpath(
+            f"jstmc{self.config.version}_{self._set_name_fa()}_{self._set_name_fov()}_{self.params.phaseDir}_sequence"
+            f"-info"
+        )
+        save_file = path.joinpath(file_name).with_suffix(".json")
+        with open(save_file, "w") as j_file:
+            json.dump(sequence_info, j_file, indent=2)
+
+    def write_k_traj(self, k_traj: pd.DataFrame):
+        out_path = plib.Path(self.config.outputPath).absolute()
+        # check exist
+        out_path.mkdir(parents=True, exist_ok=True)
+        f_name = out_path.joinpath("k_space_trajectories_df").with_suffix(".json")
+        self._save_pd_df(pd_df=k_traj, save_path=f_name)
+
+    @staticmethod
+    def _save_pd_df(pd_df: pd.DataFrame, save_path: typing.Union[str, plib.Path]):
+        save_path = plib.Path(save_path).absolute()
+        if save_path.suffixes:
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            save_path.mkdir(parents=True, exist_ok=True)
+        logModule.info(f"writing sampling pattern file: {save_path.as_posix()}")
+        if ".pkl" in save_path.suffixes:
+            pd_df.to_pickle(save_path.as_posix())
+        elif ".json" in save_path.suffixes:
+            pd_df.to_json(save_path.as_posix(), indent=2)
+        elif ".csv" in save_path.suffixes:
+            pd_df.to_csv(save_path.as_posix())
+        else:
+            logModule.info("no file extension specified or extension not supported, saving as .pkl")
+            save_path = save_path.with_suffix(".pkl")
+            pd_df.to_pickle(save_path.as_posix())
 
     def check_output_path(self):
         if not self.config.outputPath:

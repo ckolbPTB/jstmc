@@ -12,6 +12,7 @@ import pypulseq.rotate as pp_rot
 import numpy as np
 import rf_pulse_files as rfpf
 import logging
+import copy
 
 logModule = logging.getLogger(__name__)
 
@@ -26,6 +27,9 @@ class Event:
 
     def to_simple_ns(self):
         raise NotImplementedError
+
+    def copy(self):
+        return copy.deepcopy(self)
 
 
 class RF(Event):
@@ -65,7 +69,7 @@ class RF(Event):
         signal = rf.amplitude * np.exp(1j * rf.phase)
         # calculate raster with assigned duration, we set the signal to be rastered on rf raster of 1 us
         delta_t = system.rf_raster_time
-        t_array_s = rf_instance.set_on_raster(np.arange(0, int(duration_s*1e6)) * 1e-6)
+        t_array_s = rf_instance.set_on_raster(np.arange(0, int(duration_s * 1e6)) * 1e-6)
         # interpolate signal to new time
         signal_interp = np.interp(
             t_array_s,
@@ -103,6 +107,49 @@ class RF(Event):
         rf_instance = cls()
         rf_instance.system = system
         rf_simple_ns = pp.make_sinc_pulse(
+            use=pulse_type,
+            flip_angle=flip_angle_rad,
+            delay=delay_s,
+            duration=duration_s,
+            freq_offset=freq_offset_hz,
+            phase_offset=phase_offset_rad + phase_rad,
+            return_gz=False,
+            time_bw_product=time_bw_prod,
+            system=system
+        )
+        rf_instance.flip_angle_deg = flip_angle_rad * 180.0 / np.pi
+        rf_instance.phase_deg = phase_offset_rad * 180.0 / np.pi
+        rf_instance.pulse_type = pulse_type
+        rf_instance.extRfFile = ""
+
+        rf_instance.flip_angle_rad = flip_angle_rad
+        rf_instance.phase_rad = phase_rad
+
+        rf_instance.freq_offset_hz = freq_offset_hz
+        rf_instance.phase_offset_rad = phase_offset_rad
+
+        rf_instance.t_delay_s = delay_s
+        rf_instance.t_duration_s = duration_s
+        rf_instance.t_ringdown_s = system.rf_ringdown_time
+        rf_instance.t_dead_time_s = system.rf_dead_time
+        rf_instance.t_array_s = rf_instance.set_on_raster(np.linspace(0, duration_s, rf_simple_ns.signal.shape[0]))
+
+        rf_instance.bandwidth_hz = time_bw_prod / duration_s
+        rf_instance.time_bandwidth = time_bw_prod
+
+        rf_instance.signal = rf_simple_ns.signal
+        rf_instance.system = system
+        return rf_instance
+
+    @classmethod
+    def make_gauss_pulse(cls, flip_angle_rad: float, system: pp.Opts, phase_rad: float = 0.0,
+                         pulse_type: str = 'excitation',
+                         delay_s: float = 0.0, duration_s: float = 2e-3,
+                         freq_offset_hz: float = 0.0, phase_offset_rad: float = 0.0,
+                         time_bw_prod: float = 2):
+        rf_instance = cls()
+        rf_instance.system = system
+        rf_simple_ns = pp.make_gauss_pulse(
             use=pulse_type,
             flip_angle=flip_angle_rad,
             delay=delay_s,
@@ -187,7 +234,7 @@ class GRAD(Event):
         super().__init__()
         self.channel: str = 'z'
         self.amplitude: typing.Union[float, np.ndarray] = 0.0
-        self.area: float = 0.0
+        self.area: typing.Union[float,np.ndarray] = 0.0
         self.flat_area: float = 0.0
 
         self.t_array_s: np.ndarray = np.zeros(0)
@@ -307,6 +354,14 @@ class GRAD(Event):
         t_minimum_re_grad = grad_instance.set_on_raster(t_minimum_re_grad)
 
         # calculations
+        def get_area_asym_grad(amp_h: float, time_h: float, time_htol: float, time_0toh: float = t_ramp_unipolar,
+                               amp_l: float = amplitude) -> float:
+            """
+            we want to calculate the area / moment from an assymetric gradient part
+            """
+            area = 0.5 * time_0toh * amp_h + time_h * amp_h + 0.5 * (amp_h - amp_l) * time_htol + time_htol * amp_l
+            return area
+
         def get_asym_grad_amplitude(
                 duration: float, moment: float,
                 t_asym_ramp: float = t_ramp_unipolar, t_zero_ramp: float = t_ramp_unipolar,
@@ -319,14 +374,24 @@ class GRAD(Event):
 
         def get_asym_grad_min_duration(max_amplitude: float, moment: float,
                                        t_asym_ramp: float = t_ramp_unipolar, t_zero_ramp: float = t_ramp_unipolar,
-                                       asym_amplitude: float = amplitude) -> float:
+                                       asym_amplitude: float = amplitude) -> (float, float):
             """
             calculate the duration of the re/pre gradient given ramp times to 0 and slice select amplitude,
              respectively and a maximal re/pre gradient amplitude
             """
-            return grad_instance.set_on_raster(
+            t_min_duration = grad_instance.set_on_raster(
                 (moment - asym_amplitude * t_asym_ramp / 2) / max_amplitude + t_asym_ramp / 2 + t_zero_ramp / 2
             )
+            if np.abs(get_area_asym_grad(
+                    amp_h=max_amplitude, time_h=t_min_duration - t_asym_ramp - t_zero_ramp,
+                    time_htol=t_asym_ramp, time_0toh=t_zero_ramp, amp_l=asym_amplitude)) - np.abs(moment) > 0:
+                # absolute moment was increased, possibly due to np.ceil call in set raster time.
+                # apparent prolonging of timing, we can pull it back by slight decreasing of amplitude
+                max_amplitude = get_asym_grad_amplitude(
+                    duration=t_min_duration, moment=moment,
+                    t_asym_ramp=t_asym_ramp, t_zero_ramp=t_zero_ramp, asym_amplitude=asym_amplitude
+                )
+            return t_min_duration, max_amplitude
 
         # pre moment
         if np.abs(pre_moment) > 1e-7:
@@ -338,12 +403,13 @@ class GRAD(Event):
                 # we can adopt here also with doubling the ramp times in case we have opposite signs
             # want to minimize timing of gradient - use max grad
             pre_grad_amplitude = np.sign(pre_moment) * system.max_grad
-            duration_pre_grad = get_asym_grad_min_duration(max_amplitude=pre_grad_amplitude, moment=pre_moment)
-            pre_t_flat = grad_instance.set_on_raster(duration_pre_grad - 2 * t_ramp_unipolar)
+            duration_pre_grad, pre_grad_amplitude = get_asym_grad_min_duration(max_amplitude=pre_grad_amplitude,
+                                                                               moment=pre_moment)
             if duration_pre_grad < t_minimum_re_grad:
                 # stretch to minimum required time
                 duration_pre_grad = t_minimum_re_grad
                 pre_grad_amplitude = get_asym_grad_amplitude(duration=duration_pre_grad, moment=pre_moment)
+            pre_t_flat = grad_instance.set_on_raster(duration_pre_grad - 2 * t_ramp_unipolar)
             amps.extend([pre_grad_amplitude, pre_grad_amplitude, amplitude])
             times.extend([t_ramp_unipolar, t_ramp_unipolar + pre_t_flat, duration_pre_grad])
         else:
@@ -383,9 +449,10 @@ class GRAD(Event):
                 re_grad_amplitude = get_asym_grad_amplitude(
                     duration=duration_re_grad, moment=re_spoil_moment,
                     t_asym_ramp=t_ramp_asym)
+                # but if that exceeds grad limit we need to prolong the time
                 if np.abs(re_grad_amplitude) > system.max_grad:
                     re_grad_amplitude = np.sign(re_spoil_moment) * system.max_grad
-                    duration_re_grad = get_asym_grad_min_duration(
+                    duration_re_grad, re_grad_amplitude = get_asym_grad_min_duration(
                         max_amplitude=re_grad_amplitude, moment=re_spoil_moment, t_asym_ramp=t_ramp_asym)
                 re_t_flat = grad_instance.set_on_raster(duration_re_grad - t_ramp_unipolar - t_ramp_asym)
                 amps.extend([re_grad_amplitude, re_grad_amplitude])
@@ -393,7 +460,7 @@ class GRAD(Event):
             else:
                 # want to minimize timing of gradient - use max grad
                 re_grad_amplitude = np.sign(re_spoil_moment) * system.max_grad
-                duration_re_grad = get_asym_grad_min_duration(
+                duration_re_grad, re_grad_amplitude = get_asym_grad_min_duration(
                     max_amplitude=re_grad_amplitude, moment=re_spoil_moment, t_asym_ramp=t_ramp_asym
                 )
                 re_t_flat = grad_instance.set_on_raster(duration_re_grad - t_ramp_asym - t_ramp_unipolar)
@@ -406,7 +473,13 @@ class GRAD(Event):
                     re_grad_amplitude = amplitude
                     ramp_time = grad_instance.set_on_raster(np.abs(re_spoil_moment * 2 / re_grad_amplitude))
                     min_ramp_time = grad_instance.set_on_raster(np.abs(amplitude / system.max_slew))
-                    duration_re_grad = np.max([ramp_time, min_ramp_time])
+                    if min_ramp_time > ramp_time:
+                        warn = f"rephasing area low, need only a ramp." \
+                               f"ramp slew rate too high, revert to maximal possible" \
+                               f"-> can lead to slight deviations in ramp area! change spoiling gradient to avoid!"
+                        logModule.warning(warn)
+                        ramp_time = min_ramp_time
+                    duration_re_grad = ramp_time
             t += duration_re_grad
         else:
             t += grad_instance.set_on_raster(np.abs(amplitude / system.max_slew))
@@ -523,9 +596,10 @@ class GRAD(Event):
 
     def get_duration(self):
         # 0 for empty init grad
+        t = self.t_delay_s
         if self.t_array_s.__len__() < 1:
-            return 0.0
-        return self.t_array_s[-1]
+            return t
+        return t + self.t_array_s[-1]
 
     def to_simple_ns(self):
         simple_ns = types.SimpleNamespace(
@@ -542,7 +616,9 @@ class GRAD(Event):
         ax = fig.add_subplot()
         gamma = self.system.gamma
         amplitude = self.amplitude / gamma * 1e3
-        ax.plot(self.t_array_s, amplitude)
+        ax.plot(self.t_array_s * 1e3, amplitude)
+        ax.set_xlabel("time [ms]")
+        ax.set_ylabel("grad amp [mT/m]")
         plt.show()
 
     def calculate_asym_area(self, forward: bool = True):
@@ -553,8 +629,9 @@ class GRAD(Event):
             times = times[::-1]
         amplitude_a = amps[1]
         amplitude_b = amps[3]
-        delta_t = np.abs(np.diff(times))
-        area = amplitude_a * (delta_t[0] / 2 + delta_t[1] + delta_t[2] / 2) + amplitude_b * delta_t[2] / 2
+        delta_t = np.abs(np.diff(times))[:3]
+        factor = np.array([0.5, 1.0, 0.5])
+        area = amplitude_a * np.sum(factor * delta_t) + amplitude_b * delta_t[2] / 2
         return area
 
 
@@ -596,10 +673,11 @@ class ADC(Event):
         adc_instance.t_dead_time_s = adc_ns.dead_time
         adc_instance.freq_offset_hz = adc_ns.freq_offset
         adc_instance.phase_offset_rad = adc_ns.phase_offset
+        adc_instance.set_on_raster()
         return adc_instance
 
     def get_duration(self):
-        return self.t_duration_s
+        return self.t_duration_s + self.t_delay_s
 
     def to_simple_ns(self):
         return types.SimpleNamespace(
@@ -607,6 +685,31 @@ class ADC(Event):
             freq_offset=self.freq_offset_hz, num_samples=self.num_samples,
             phase_offset=self.phase_offset_rad, type='adc'
         )
+
+    def plot(self):
+        fig = plt.figure()
+        ax = fig.add_subplot()
+        amplitude = np.array([0, 0, 1, 1, 0])
+        times = np.array(
+            [0, self.t_delay_s - 1e-9, self.t_delay_s + 1e-9, self.get_duration() - 1e-9, self.get_duration() + 1e-9])
+        ax.plot(times * 1e3, amplitude)
+        ax.set_xlabel("time [ms]")
+        ax.set_ylabel("ADC")
+        plt.show()
+
+    def set_on_raster(self):
+        raster_time = float(self.system.adc_raster_time)
+        to_set = ["t_dwell_s", "t_delay_s", "t_duration_s"]
+        # save number of samples
+        n = int(self.t_duration_s / self.t_dwell_s)
+        for key in to_set:
+            value = self.__getattribute__(key)
+            if np.abs(value) % raster_time > 1e-9:
+                rastered_value = np.ceil(value / raster_time) * raster_time
+                self.__setattr__(key, rastered_value)
+                if key == "t_dwell_s":
+                    # if dwell changed adopt
+                    self.t_duration_s = n * self.t_dwell_s
 
 
 class DELAY(Event):
@@ -619,6 +722,7 @@ class DELAY(Event):
         delay_instance = cls()
         delay_instance.system = system
         delay_instance.t_duration_s = delay
+        delay_instance.set_on_block_raster()
         return delay_instance
 
     def check_on_block_raster(self) -> bool:
@@ -639,7 +743,7 @@ class DELAY(Event):
         if us_value % us_raster < 1e-4:
             rastered_value = us_value
         else:
-            rastered_value = np.round(us_value / us_raster) * us_raster
+            rastered_value = int(np.ceil(us_value / us_raster) * us_raster)
         self.t_duration_s = rastered_value * 1e-6
 
     def get_duration(self):
