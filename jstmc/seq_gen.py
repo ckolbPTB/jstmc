@@ -24,14 +24,11 @@ class GenSequence:
         if self.params.trajectoryType.lower() == "cartesian":
             number_of_ET = self.params.numberOfCentralLines + self.params.numberOfOuterLines
         elif self.params.trajectoryType.lower() == "radial":
-            if self.params.radialSameTrajPerEcho:
-                number_of_ET = self.params.radialNumSpokes
-            else:
-                number_of_ET = int(np.floor(self.params.radialNumSpokes / self.params.ETL))
-                if number_of_ET * self.params.ETL < self.params.radialNumSpokes:
-                    logModule.info(f"with an ETL of {self.params.ETL} only a  total number "\
-                        f"of spokes of {self.params.ETL * number_of_ET} rather than "\
-                        f"{self.params.radialNumSpokes} is possible")
+            number_of_ET = int(np.floor(self.params.radialNumSpokes / self.params.ETL))
+            if number_of_ET * self.params.ETL < self.params.radialNumSpokes:
+                log_module.info(f"with an ETL of {self.params.ETL} only a  total number "\
+                    f"of spokes of {self.params.ETL * number_of_ET} rather than "\
+                    f"{self.params.radialNumSpokes} is possible")
         else:
             raise TypeError(f"trajectory type {self.params.trajectoryType.lower()} not recognised")
         
@@ -118,7 +115,8 @@ class GenSequence:
                 self.k_indexes[:, :] = np.arange(self.params.numberOfCentralLines + self.params.numberOfOuterLines)
         elif self.params.trajectoryType.lower() == "radial": 
             if self.params.radialSameTrajPerEcho:
-                self.k_indexes[:, :] = np.arange(self.params.radialNumSpokes)
+                num_spokes_per_ET = self.k_indexes.shape[1]
+                self.k_indexes[:, :] = np.arange(num_spokes_per_ET)
             else:
                 num_spokes_per_ET = self.k_indexes.shape[1]
                 self.k_indexes[:, :] = np.reshape(np.arange(self.params.ETL * num_spokes_per_ET), 

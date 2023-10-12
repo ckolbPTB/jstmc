@@ -385,23 +385,25 @@ class JsTmcSequence(seq_gen.GenSequence):
             sbb.grad_read.rotation_axis = "z"
 
     def _set_end_spoil_phase_grad(self):
-        factor = np.array([0.5, 1.0, 0.5])
+        if self.params.trajectoryType.lower() == "cartesian":
+            factor = np.array([0.5, 1.0, 0.5])
 
-        # get phase moment of last phase encode
-        pe_grad_amp = self.block_refocus.grad_phase.amplitude[-2]
-        pe_grad_times = self.block_refocus.grad_phase.t_array_s[-4:]
-        delta_times = np.diff(pe_grad_times)
-        area = np.sum(delta_times * pe_grad_amp * factor)
+            # get phase moment of last phase encode
+            pe_grad_amp = self.block_refocus.grad_phase.amplitude[-2]
+            pe_grad_times = self.block_refocus.grad_phase.t_array_s[-4:]
+            delta_times = np.diff(pe_grad_times)
+            area = np.sum(delta_times * pe_grad_amp * factor)
 
-        # adopt last grad to inverse area
-        pe_end_times = self.block_spoil_end.grad_phase.t_array_s[-4:]
-        delta_end_times = np.diff(pe_end_times)
-        pe_end_amp = area / np.sum(factor * delta_end_times)
-        if np.abs(pe_end_amp) > self.system.max_grad:
-            err = f"amplitude violation upon last pe grad setting"
-            logModule.error(err)
-            raise AttributeError(err)
-        self.block_spoil_end.grad_phase.amplitude[1:3] = - pe_end_amp
+            # adopt last grad to inverse area
+            pe_end_times = self.block_spoil_end.grad_phase.t_array_s[-4:]
+            delta_end_times = np.diff(pe_end_times)
+            pe_end_amp = area / np.sum(factor * delta_end_times)
+            if np.abs(pe_end_amp) > self.system.max_grad:
+                err = f"amplitude violation upon last pe grad setting"
+                logModule.error(err)
+                raise AttributeError(err)
+            self.block_spoil_end.grad_phase.amplitude[1:3] = - pe_end_amp
+
 
     def _apply_slice_offset(self, idx_slice: int):
         for sbb in [self.block_excitation, self.block_refocus_1, self.block_refocus]:
