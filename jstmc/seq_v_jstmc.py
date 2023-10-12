@@ -109,6 +109,7 @@ class JsTmcSequence(seq_gen.GenSequence):
         min_esp = 2 * np.max([t_exci_ref, t_ref_1_adc, t_ref_2_adc]) * 1e3
         logModule.info(f"\t\t-found minimum ESP: {self.params.ESP:.2f} ms")
         if self.params.ESP < min_esp:
+            self.params.ESP = min_esp
             logModule.warning(f"ESP set to minimum value: {self.params.ESP:.2f} ms")
         
 
