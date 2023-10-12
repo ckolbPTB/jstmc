@@ -106,8 +106,11 @@ class JsTmcSequence(seq_gen.GenSequence):
                       self.block_refocus_1.rf.t_duration_s / 2 + self.block_acquisition.get_duration() / 2
         t_ref_2_adc = self.block_acquisition.get_duration() / 2 + self.block_refocus.get_duration() / 2
 
-        self.params.ESP = 2 * np.max([t_exci_ref, t_ref_1_adc, t_ref_2_adc]) * 1e3
+        min_esp = 2 * np.max([t_exci_ref, t_ref_1_adc, t_ref_2_adc]) * 1e3
         logModule.info(f"\t\t-found minimum ESP: {self.params.ESP:.2f} ms")
+        if self.params.ESP < min_esp:
+            logModule.warning(f"ESP set to minimum value: {self.params.ESP:.2f} ms")
+        
 
         if np.abs(t_ref_1_adc - t_ref_2_adc) > 1e-6:
             logModule.error(f"refocus to adc timing different from adc to refocus. Systematic error in seq. creation")
