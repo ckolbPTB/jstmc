@@ -136,12 +136,15 @@ class JsTmcSequence(seq_gen.GenSequence):
 
         t_total_etl = t_pre_etl + t_etl + t_post_etl
         # time for fid navs - one delay in between
-        t_total_fid_nav = np.sum(
-            [b.get_duration() for b in self.block_list_fid_nav_acq]
-        ) + np.sum(
-            [b.get_duration() for b in self.block_list_fid_nav_acq[:-1]]
-        )
-        logModule.info(f"\t\t-total fid-nav time (2 navs + 1 delay of 10ms): {t_total_fid_nav * 1e3:.2f} ms")
+        if self.nav_num > 0:
+            t_total_fid_nav = np.sum(
+                [b.get_duration() for b in self.block_list_fid_nav_acq]
+            ) + np.sum(
+                [b.get_duration() for b in self.block_list_fid_nav_acq[:-1]]
+            )
+            logModule.info(f"\t\t-total fid-nav time (2 navs + 1 delay of 10ms): {t_total_fid_nav * 1e3:.2f} ms")
+        else:
+            t_total_fid_nav = 0.0
         # deminish TR by FIDnavs
         tr_eff = self.params.TR * 1e-3 - t_total_fid_nav
         max_num_slices = int(np.floor(tr_eff / t_total_etl))
@@ -151,8 +154,9 @@ class JsTmcSequence(seq_gen.GenSequence):
         if self.params.resolutionNumSlices > max_num_slices:
             logModule.info(f"increase TR or Concatenation needed")
         # we want to add a delay additionally after fid nav block
+        num_delays = 1 if self.params.resolutionNumSlices == 1 else (self.params.resolutionNumSlices + 1)
         self.delay_slice = events.DELAY.make_delay(
-            (tr_eff - self.params.resolutionNumSlices * t_total_etl) / (self.params.resolutionNumSlices + 1),
+            (tr_eff - self.params.resolutionNumSlices * t_total_etl) / num_delays,
             system=self.system
         )
         logModule.info(f"\t\t-time between slices: {self.delay_slice.get_duration() * 1e3:.2f} ms")
