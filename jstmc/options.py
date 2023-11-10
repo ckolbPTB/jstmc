@@ -152,6 +152,8 @@ class SequenceParameters(sp.helpers.Serializable):
         self.radialNumSpokes = self.resolutionBase # fully sampled in the Cartesian sense, i.e. without factor pi/2
         self.radialAngStep = np.pi / self.radialNumSpokes # uniform radial sampling
         self.radialAngList = self.radialAngStep * np.arange(0, self.radialNumSpokes)
+        self.sincRfExc = False
+        self.sincRfRef = False
 
         # casting
         self.excitationRadFA = self.excitationFA / 180.0 * np.pi

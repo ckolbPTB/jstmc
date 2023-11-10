@@ -128,6 +128,19 @@ class Kernel:
                 fname=params.extRfExc, flip_angle_rad=params.excitationRadFA, phase_rad=params.excitationRadRfPhase,
                 system=system, duration_s=params.excitationDuration * 1e-6, pulse_type='excitation'
             )
+        elif params.sincRfExc:
+            log_module.info(f"rf -- build sinc pulse")
+            time_bw_prod = params.excitationTimeBwProd
+            rf = events.RF.make_sinc_pulse(
+                flip_angle_rad=params.excitationRadFA,
+                phase_rad=params.excitationRadRfPhase,
+                pulse_type="excitation",
+                delay_s=0.0,
+                duration_s=params.excitationDuration * 1e-6,
+                time_bw_prod=time_bw_prod,
+                freq_offset_hz=0.0, phase_offset_rad=0.0,
+                system=system
+            )
         else:
             log_module.info(f"rf -- build gauss pulse")
             time_bw_prod = params.excitationTimeBwProd
@@ -211,8 +224,20 @@ class Kernel:
                 duration_s=params.refocusingDuration * 1e-6, flip_angle_rad=np.pi,
                 phase_rad=0.0, pulse_type='refocusing'
             )
+        elif params.sincRfRef:
+            log_module.info(f"rf -- build sinc pulse")
+            rf = events.RF.make_sinc_pulse(
+                flip_angle_rad=params.refocusingRadFA[pulse_num],
+                phase_rad=params.refocusingRadRfPhase[pulse_num],
+                pulse_type="refocusing",
+                delay_s=0.0,
+                duration_s=params.refocusingDuration * 1e-6,
+                time_bw_prod=params.excitationTimeBwProd,
+                freq_offset_hz=0.0, phase_offset_rad=0.0,
+                system=system
+            )
         else:
-            log_module.info(f"rf -- build sync pulse")
+            log_module.info(f"rf -- build gauss pulse")
             rf = events.RF.make_gauss_pulse(
                 flip_angle_rad=params.refocusingRadFA[pulse_num],
                 phase_rad=params.refocusingRadRfPhase[pulse_num],
