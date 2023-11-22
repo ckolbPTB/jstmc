@@ -125,7 +125,10 @@ class GenSequence:
             raise TypeError(f"trajectory type {self.params.trajectoryType.lower()} not recognised")
 
     def _calculate_scan_time(self):
-        t_total = self.params.TR * 1e-3 * (self.params.numberOfCentralLines + self.params.numberOfOuterLines)
+        if type(self.params.TR) in (float, int):
+            t_total = self.params.TR * 1e-3 * (self.params.numberOfCentralLines + self.params.numberOfOuterLines)
+        else:
+            t_total = np.sum(self.params.TR) * 1e-3
         log_module.info(f"\t\t-total scan time: {t_total / 60:.1f} min ({t_total:.1f} s)")
 
     def _set_delta_slices(self):

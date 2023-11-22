@@ -146,23 +146,31 @@ class JsTmcSequence(seq_gen.GenSequence):
         else:
             t_total_fid_nav = 0.0
         # deminish TR by FIDnavs
-        tr_eff = self.params.TR * 1e-3 - t_total_fid_nav
-        max_num_slices = int(np.floor(tr_eff / t_total_etl))
+        if type(self.params.TR) in (float, int):
+            tr_eff = np.asarray([self.params.TR * 1e-3 - t_total_fid_nav,])
+            max_num_slices = int(np.floor(tr_eff[0] / t_total_etl))
+            num_delays = 1 if self.params.resolutionNumSlices == 1 else (self.params.resolutionNumSlices + 1)
+        else:
+            tr_eff = self.params.TR * 1e-3 - t_total_fid_nav
+            max_num_slices = 1
+            num_delays = 1
+
         logModule.info(f"\t\t-total echo train length: {t_total_etl * 1e3:.2f} ms")
         logModule.info(f"\t\t-desired number of slices: {self.params.resolutionNumSlices}")
         logModule.info(f"\t\t-possible number of slices within TR: {max_num_slices}")
         if self.params.resolutionNumSlices > max_num_slices:
             logModule.info(f"increase TR or Concatenation needed")
-        # we want to add a delay additionally after fid nav block
-        num_delays = 1 if self.params.resolutionNumSlices == 1 else (self.params.resolutionNumSlices + 1)
-        self.delay_slice = events.DELAY.make_delay(
-            (tr_eff - self.params.resolutionNumSlices * t_total_etl) / num_delays,
-            system=self.system
-        )
-        logModule.info(f"\t\t-time between slices: {self.delay_slice.get_duration() * 1e3:.2f} ms")
-        if not self.delay_slice.check_on_block_raster():
-            self.delay_slice.set_on_block_raster()
-            logModule.info(f"\t\t-adjusting TR delay to raster time: {self.delay_slice.get_duration() * 1e3:.2f} ms")
+
+        self.delay_slice = [0,]*len(tr_eff)
+        for delay_idx, curr_tr in enumerate(tr_eff):
+            self.delay_slice[delay_idx] = events.DELAY.make_delay(
+                (curr_tr - self.params.resolutionNumSlices * t_total_etl) / num_delays,
+                system=self.system
+            )
+            logModule.info(f"\t\t-time between slices: {self.delay_slice[delay_idx].get_duration() * 1e3:.2f} ms")
+            if not self.delay_slice[delay_idx].check_on_block_raster():
+                self.delay_slice[delay_idx].set_on_block_raster()
+                logModule.info(f"\t\t-adjusting TR delay to raster time: {self.delay_slice[delay_idx].get_duration() * 1e3:.2f} ms")
 
     def build(self):
         logModule.info(f"__Build Sequence__")
@@ -286,7 +294,16 @@ class JsTmcSequence(seq_gen.GenSequence):
                 self._set_end_spoil_phase_grad()
                 self.seq.ppSeq.add_block(*self.block_spoil_end.list_events_to_ns())
                 # insert slice delay
-                self.seq.ppSeq.add_block(self.delay_slice.to_simple_ns())
+                if len(self.delay_slice) == 1:
+                    self.seq.ppSeq.add_block(self.delay_slice[0].to_simple_ns())
+                else:
+                    if len(self.delay_slice) > idx_n:
+                        self.seq.ppSeq.add_block(self.delay_slice[idx_n].to_simple_ns())
+                    else:
+                        err = ['length of delay_slice (TR) should be 1 (constant for each train) or number of trains '
+                               f'({self.k_indexes.shape[1]}) but it is {len(self.delay_slice)}']
+                        logModule.error(err)
+                        raise AttributeError(err)
 
             # navigators
             for nav_idx in range(self.nav_num):
