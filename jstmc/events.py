@@ -415,6 +415,8 @@ class GRAD(Event):
         else:
             # ramp up only, no pre moment
             duration_pre_grad = grad_instance.set_on_raster(np.abs(amplitude / system.max_slew))
+            # make sure that the duration is longer than the rf dead time
+            duration_pre_grad = max(duration_pre_grad, system.rf_dead_time)
             times.append(duration_pre_grad)
             amps.append(amplitude)
         # flat part of slice select gradient. an rf would start here, hence save delay
